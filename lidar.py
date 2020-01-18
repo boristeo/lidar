@@ -12,6 +12,8 @@ lidar_data = [(0, 0) for i in range(360)]
 
 ZERO_I_OFFSET = 140
 
+lidar_orientation = 0
+wall_orientation = 90
 
 class Visualization:
   point = points(pos=[(0,0,0) for i in range(360)], size=5, color=(0 , 1, 0))
@@ -24,8 +26,11 @@ class Visualization:
 vis = Visualization()
 
 def update_view(start_angle, packet_data):
-  angle = start_angle
+  global lidar_orientation
+  angle = start_angle + int(lidar_orientation)
   for data in packet_data:
+    if angle >= 360:
+      angle %= 360
 
     DIST_MASK = 0x3fff
     BAD_MASK = 0x4000 
@@ -53,13 +58,16 @@ def update_view(start_angle, packet_data):
       vis.pointi.color[angle] = vector( 0, 1, 0)
 
     angle += 1
-    if angle >= 360:
-      angle = 0
-      rel_angle, d_normal = get_relative_pos_to_wall(90)
-      vis.label_angle.text = str(rel_angle) + ' degrees'
-      vis.label_dist.text = str(d_normal) + 'mm'
 
+def update_position():
+  global lidar_orientation, wall_orientation
+  rel_angle, d_normal = get_relative_pos_to_wall(wall_orientation)
+  lidar_orientation += rel_angle
+  vis.label_angle.text = str(lidar_orientation) + ' degrees'
+  vis.label_dist.text = str(d_normal) + 'mm'
+  
 def get_relative_pos_to_wall(angle):
+
   x1, y1 = lidar_data[angle - 5]
   x2, y2 = lidar_data[angle + 5]
   rel_angle_5 = math.degrees(math.atan2(y1 - y2, x1 - x2))
@@ -71,15 +79,16 @@ def get_relative_pos_to_wall(angle):
   rel_angle_15 = math.degrees(math.atan2(y1 - y2, x1 - x2))
 
   if abs(rel_angle_5 - rel_angle_10) > 5 or abs(rel_angle_10 - rel_angle_15) > 5:
-    rel_angle = int(min(rel_angle_5, rel_angle_10, rel_angle_15, key=lambda x: abs(x)))
+    rel_angle = min(rel_angle_5, rel_angle_10, rel_angle_15, key=lambda x: abs(x))
   else:
-    rel_angle = int(rel_angle_15)
-  x3, y3 = lidar_data[angle + rel_angle]
+    rel_angle = rel_angle_15
+  x3, y3 = lidar_data[angle + int(rel_angle)]
   d_normal = (x3 ** 2 + y3 ** 2) ** 0.5
   
   return (-rel_angle, d_normal)
 
 def read_Lidar():
+  received = 0
   while True:
     try:
       ser.read_until('\nab\n', 1440)
@@ -93,6 +102,11 @@ def read_Lidar():
       data = struct.unpack('<' + str(count / 2) + 'H', ser.read(count))
       
       update_view(angle, data)
+
+      received += count >> 1 
+      if received > 360:
+        received %= 360
+        update_position()
             
     except :
         traceback.print_exc(file=sys.stdout)
