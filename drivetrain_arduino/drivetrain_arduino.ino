@@ -3,51 +3,36 @@
 #include <SoftwareSerial.h>
 #include <Servo.h>
 
-#define LEFTWHEEL 0
-#define RIGHTWHEEL 1
-#define FRONTWHEEL 0
-#define BACKWHEEL 2
 
-#define MFWD 0
-#define MBCK 1
-#define MBRK 2
-#define MREL 3
-#define TOPSPEED 7
-
-#define TURN180 129
-
-#define TOGGLEDOORS 130
-#define OPENDOORS 131
-#define CLOSEDOORS 132
-#define OPEN 20
-#define CLOSED 115
-
-#define COLLISIONAVOIDANCE false
-
-#define NONE 0
 
 namespace {
+  const uint8_t NONE        = 128;
+  const uint8_t TURN180     = 129;
+  const uint8_t TOGGLEDOORS = 130;
+  const uint8_t OPENDOORS   = 131;
+  const uint8_t CLOSEDOORS  = 132;
+
+  const uint8_t OPEN        = 20;
+  const uint8_t CLOSED      = 115;
+
   Adafruit_MotorShield AFMS = Adafruit_MotorShield();
 
   Adafruit_DCMotor *motors[4] = {AFMS.getMotor(4), AFMS.getMotor(3), AFMS.getMotor(1), AFMS.getMotor(2)};
   Servo servo1;
   Servo servo2;
 
-  struct control_packet {
-    uint8_t wheel : 2;
-    uint8_t mode  : 2;
-    uint8_t speed : 3;
-    bool special  : 1;
-  };
-
-  // spd is 0-7
-  void setWheel(unsigned int wheel, unsigned int mode, unsigned int spd) {
-    motors[wheel % 4]->setSpeed(spd * 32);
-    motors[wheel % 4]->run(mode + 1);
+  void setWheel(uint8_t p) {
+    if (p & 0x80) {
+      return;
+    }
+    motors[p & 0x03]->setSpeed(((p >> 4) & 0x07) * 32);
+    motors[p & 0x03]->run(((p >> 2) & 0x03) + 1);
   }
-  void setWheel(control_packet p) {
-    motors[p.wheel % 4]->setSpeed(p.speed * 32);
-    motors[p.wheel % 4]->run(p.mode + 1);
+  void allWheels(uint8_t mode, uint8_t spd) {
+    setWheel(0 | mode << 2 | spd << 4);
+    setWheel(1 | mode << 2 | spd << 4);
+    setWheel(2 | mode << 2 | spd << 4);
+    setWheel(3 | mode << 2 | spd << 4);
   }
 
   void setDoors(int angle) {
@@ -59,22 +44,15 @@ namespace {
   }
 
   void turn(int degs) {
-    int mode = degs < 0;
-    setWheel(FRONTWHEEL + mode, MFWD, TOPSPEED);
-    setWheel(BACKWHEEL + mode, MFWD, TOPSPEED);
+    auto mode = degs < 0 ? 1 : 0;
 
-    setWheel(FRONTWHEEL + mode + 1, MBCK, TOPSPEED);
-    setWheel(BACKWHEEL + mode + 1, MBCK, TOPSPEED);
+    setWheel((0 + mode) & 3 | 0 << 2| 7 << 4);
+    setWheel((2 + mode) & 3 | 0 << 2| 7 << 4);
+    setWheel((1 + mode) & 3 | 1 << 2| 7 << 4);
+    setWheel((3 + mode) & 3 | 1 << 2| 7 << 4);
 
   }
 
-
-  void allWheels(int mode, int spd) {
-    setWheel(0, mode, spd);
-    setWheel(1, mode, spd);
-    setWheel(2, mode, spd);
-    setWheel(3, mode, spd);
-  }
 
 }
 
@@ -91,55 +69,57 @@ void setup() {
 }
 
 void loop() {
-  static control_packet p;
   static volatile unsigned long long lastMillis;
-  static volatile int maneuver = NONE;
+  static volatile uint8_t maneuver = NONE;
   static volatile int doorAngle = 90;
 
   if (Serial1.available()) {
-    Serial1.readBytes((uint8_t *) &p, 1);
-    if (p.special) {
-      maneuver = *((uint8_t *) &p);
-    } 
-    else { // normal wheel control packet
-      setWheel(p);
-    }
+    maneuver = Serial1.read();
+    setWheel(maneuver);
     lastMillis = millis();
   }
 
   // MANEUVER ACTIONS
 
-  if (maneuver == TURN180) {
-    // turn, stop after 500 millis
+  switch (maneuver) {
+  case TURN180:
+    // stop turn after 500 millis
     if (millis() - lastMillis > 500) {
       maneuver = NONE;
-    } else {
+    } 
+    else {
       turn(180);
     }
-  }
-  // open and close doors, stop at 0 or 90 degrees
-  if (maneuver == OPENDOORS && millis() - lastMillis >= 10) {
-    setDoors(doorAngle);
-    doorAngle--;
-    if (doorAngle < OPEN) {
-      maneuver = NONE;
+    break;
+
+  case OPENDOORS:
+    // control number of millis per degree
+    if (millis() - lastMillis >= 10) {
+      setDoors(doorAngle);
+      doorAngle--;
+      lastMillis = millis();
+      if (doorAngle < OPEN) {
+        maneuver = NONE;
+      }
+    } 
+    break;
+
+  case CLOSEDOORS: 
+    if (millis() - lastMillis >= 10) {
+      setDoors(doorAngle);
+      doorAngle++;
+      lastMillis = millis();
+      if (doorAngle > CLOSED) {
+        maneuver = NONE;
+      }
+    }
+    break;
+
+  default:
+    if (millis() - lastMillis > 300) {
+      allWheels(2, 0);
       lastMillis = millis();
     }
-  } 
-  else if (maneuver == CLOSEDOORS && millis() - lastMillis >= 10) {
-    setDoors(doorAngle);
-    doorAngle++;
-    if (doorAngle > CLOSED) {
-      maneuver = NONE;
-      lastMillis = millis();
-
-    }
-  }
-
-  // NO MANEUVER - RESET WHEELS EVERY 300 MILLIS
-
-  if (millis() - lastMillis > 300 && maneuver == NONE) {
-    allWheels(MREL, 0);
-    lastMillis = millis();
+    break;
   }
 }
