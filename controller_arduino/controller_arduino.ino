@@ -51,7 +51,8 @@ namespace {
     XV11(HardwareSerial *s): serial(s) {}
 
     virtual uint16_t distance_at(double angle) const {
-      return distances[(size_t) (resolution() * angle / (2 * M_PI))];
+      //return distances[(size_t) (resolution() * angle / (2 * M_PI))] - 1;
+      return distances[179] > 140 ? distances[179] : 0xffff;
     }
 
     virtual bool read_full_rot() {
@@ -60,10 +61,10 @@ namespace {
 
       if (serial->available()) {
         c += read_packet(&p);
-        for (auto i = 0; i < sizeof(p.samples) / sizeof(p.samples[0]); i++) {
-          distances[p.start_index() + i] = p.samples[i].dist
-                    | p.samples[i].bad << 14 
-                    | p.samples[i].failed << 15;
+        for (auto i = 0; i < 4; i++) {
+          distances[p.start_index() + i] = p.samples[i].dist;
+                    //| p.samples[i].bad << 14 
+                    //| p.samples[i].failed << 15;
         }
       } 
       if (c > SAMPLES_PER_ROT) {
@@ -114,7 +115,7 @@ namespace {
           }
           
         case data:
-          in_packet_bytes_read += serial->readBytes(((uint8_t *) &packet) + in_packet_bytes_read, sizeof(*packet) - in_packet_bytes_read);
+          in_packet_bytes_read += serial->readBytes(((uint8_t *) packet) + in_packet_bytes_read, sizeof(*packet) - in_packet_bytes_read);
           if (in_packet_bytes_read < sizeof(*packet)) { break; }
         
           return 4;
@@ -125,13 +126,19 @@ namespace {
   };
    
 
-  class car {
-  private:
-    size_t ticks = 0;
-    double heading = 0;
 
-    HardwareSerial *drivetrain;
-    Lidar *lidar;
+  class car {
+  public:
+    class Command {
+      protected:
+        car* my_car;
+      public:
+        virtual void init() = 0;
+        virtual void on_tick() = 0;
+        virtual bool is_done() const = 0;
+        virtual void finish() = 0;
+
+    };
 
     enum motor { fl, fr, rl, rr };
     enum mmode { fwd, rev, brake, release };
@@ -141,31 +148,59 @@ namespace {
       door_op = 131,
       door_cl = 132
     };
+
+    double heading = 0;
+    const unsigned long long MILLIS_PER_TICK = 250;
+
+    HardwareSerial *drivetrain;
+    Lidar *lidar;
+
+
+    Command **commands;
+    size_t command_count = 0;
+    size_t current_command = 0;
+
     
-  public:
     car (HardwareSerial *s, Lidar *l): drivetrain(s), lidar(l) {}
 
     void on_lidar_rot() {
       update_position();
     }
     void on_tick() {
-      ticks++;
-    //  dt_write(fr, rev, 3);
+      static bool initialized = false;
+
+      if (!initialized) {
+        commands[current_command]->init();
+        initialized = true;
+      }
+      if (commands[current_command]->is_done()) {
+        commands[current_command]->finish();
+        current_command = (current_command + 1) % command_count;
+        initialized = false;
+      }
+      else {
+        commands[current_command]->on_tick();
+      }
     }
+
+    void load_commands(Command **cs, size_t count) {
+      commands = cs;
+      command_count = count;
+    }
+
     void drive() {
-      volatile auto last_millis = millis();
+      volatile long last_millis = millis();
       for (;;) {
         if (lidar->read_full_rot()) {
           on_lidar_rot();
         }
-        if (millis() - last_millis >= 250) {
+        if (millis() - last_millis >= MILLIS_PER_TICK) {
           on_tick();
           last_millis = millis();
         }
       }
     }
 
-  private:
     void dt_write(motor m, mmode mode, uint8_t v) {
       drivetrain->write(m | mode << 2 | v << 4);
     }
@@ -175,8 +210,138 @@ namespace {
     void update_position() {
       
     }
+
+    void dt_write_all(mmode mode, uint8_t v) {
+      dt_write(fr, mode, v);
+      dt_write(fl, mode, v);
+      dt_write(rr, mode, v);
+      dt_write(rl, mode, v);
+    }
   };
+
+  class DriveForMillis: public car::Command {
+  private:
+    unsigned long long target_time;
+    unsigned long long time_passed;
+    car::mmode mode;
+    uint8_t spd;
+
+  public:
+    DriveForMillis(car* my_car, unsigned long long target_time, car::mmode mode, uint8_t spd) {
+      this->target_time = target_time;
+      this->my_car = my_car;
+      this->mode = mode;
+      this->spd = spd;
+    }
+
+    virtual void init() {
+      time_passed = 0;
+    }
+    virtual void on_tick() {
+      my_car->dt_write_all(mode, spd);
+      
+      time_passed += my_car->MILLIS_PER_TICK;
+    }
+
+    virtual bool is_done() const {
+      return time_passed >= target_time;
+    }
+
+    virtual void finish() {
+      my_car->dt_write_all(car::mmode::brake, 0);
+    }
+  };
+
+  class Turn180_brya: public car::Command {
+  unsigned long long time_passed = 0;
+  public:
+    Turn180_brya(car *my_car) {
+      this->my_car = my_car;
+    }
+
+    virtual void init() {
+      time_passed = 0;
+      my_car->dt_write(car::special::turn180);
+    }
+    virtual void on_tick() {
+      my_car->dt_write_all(car::mmode::brake, 0);
+      time_passed += my_car->MILLIS_PER_TICK;
+    }
+
+    virtual bool is_done() const {
+      return time_passed >= 2000;
+    }
+
+    virtual void finish() {
+    }
+  };
+
+  class Turn180_ket: public car::Command {
+  private:
+    static const unsigned long long TIME_TO_TURN = 500;
+    static const uint8_t SPEED = 7;
+    unsigned long long time_passed;
+
+  public:
+    Turn180_ket(car* my_car) {
+      this->my_car = my_car;
+    }
+
+    virtual void init() {
+      time_passed = 0;
+    }
+    virtual void on_tick() {
+      my_car->dt_write(car::motor::fl, car::mmode::fwd, SPEED);
+      my_car->dt_write(car::motor::fr, car::mmode::rev, SPEED);
+      my_car->dt_write(car::motor::rl, car::mmode::fwd, SPEED);
+      my_car->dt_write(car::motor::rr, car::mmode::rev, SPEED);
+
+      time_passed += my_car->MILLIS_PER_TICK;
+    }
+
+    virtual bool is_done() const {
+      return time_passed >= TIME_TO_TURN;
+    }
+
+    virtual void finish() {
+      my_car->dt_write_all(car::mmode::brake, 0);
+    }
+  };
+
+  class DriveUntilObstacle: public car::Command {
+  private:
+    uint16_t distance_threshold;
+    uint8_t spd;
+
+  public:
+    DriveUntilObstacle(car* my_car, uint16_t distance_threshold, uint8_t spd) {
+     this->my_car = my_car;
+     this->distance_threshold = distance_threshold;
+     this->spd = spd;
+    }
+
+    virtual void init() {
+    }
+
+    virtual void on_tick() {
+      my_car->dt_write_all(car::mmode::fwd, spd);
+    }
+
+    virtual bool is_done() const {
+      auto d = my_car->lidar->distance_at(0);
+      Serial.println(d);
+      return d <= distance_threshold;
+    }
+
+    virtual void finish() {
+      my_car->dt_write_all(car::mmode::brake, 0);
+    }
+  };
+
+
 }
+
+
 
 void setup(){
   Serial.begin(250000);
@@ -185,46 +350,14 @@ void setup(){
   
   static XV11 lidar(&Serial2);
   static car c(&Serial1, &lidar);
+  car::Command *cs[] = { 
+    new DriveUntilObstacle(&c, 300, 3),
+    new Turn180_brya(&c)
+  };
+  c.load_commands(cs, sizeof(cs) / sizeof(*cs));
+
   c.drive();
 }
 
 
-void loop() {
-
-  /*
-  static unsigned int in_packet_start_index = 0;
-  static unsigned int last_in_packet_start_index = 0;
-  static unsigned int out_packet_start_index = 0;
-  static size_t full_rots_offset = 0;
-
-  static out_packet<SAMPLES_CT> head;
-  
-  for (;;) {
-    if (!lidar.read_packet()) { continue; }
-    
-    in_packet_start_index = lidar.packet.start_angle();
-
-    if (last_in_packet_start_index > in_packet_start_index && SAMPLES_CT >= 360) {
-      full_rots_offset += 360; // New packets will be indexed from 0, create artificial offset
-      c.on_lidar_rot();
-    }
-      
-    size_t data_index = full_rots_offset + in_packet_start_index - out_packet_start_index; 
-    if (data_index >= SAMPLES_CT) {
-      // new in_packet won't fit in out_packet, send it and prepare for next
-      head.start_angle = out_packet_start_index;
-      head.rpm = lidar.packet.rpm;
-      Serial.write((uint8_t *) &head, sizeof(head));
-      full_rots_offset = 0;
-      out_packet_start_index = in_packet_start_index;
-    }
-    for (auto i = 0; i < 4; i++) {
-      memcpy(head.samples + data_index + i, lidar.packet.samples + i, 2);
-    }
-    c.process_lidar_packet(lidar.packet);
-    
-    last_in_packet_start_index = in_packet_start_index;
-  }
-    */
-
-}
+void loop() {}
