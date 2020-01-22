@@ -7,6 +7,7 @@
 
 namespace {
   const uint8_t NONE        = 128;
+  const uint8_t CANCEL      = 255;
   const uint8_t TURN180     = 129;
   const uint8_t TOGGLEDOORS = 130;
   const uint8_t OPENDOORS   = 131;
@@ -69,22 +70,33 @@ void setup() {
 }
 
 void loop() {
-  static volatile unsigned long long lastMillis;
+  static volatile unsigned long long last_request_millis;
+  static volatile unsigned long long maneuver_millis;
   static volatile uint8_t maneuver = NONE;
   static volatile int doorAngle = 90;
 
   if (Serial1.available()) {
-    maneuver = Serial1.read();
-    setWheel(maneuver);
-    lastMillis = millis();
+    uint8_t request = Serial1.read();
+    last_request_millis = millis();
+
+    if (request & 0x80) {
+      maneuver = request;
+      maneuver_millis = millis();
+    }
+    else if (maneuver == NONE) {
+      setWheel(request);
+    }
   }
 
   // MANEUVER ACTIONS
 
   switch (maneuver) {
+  case CANCEL:
+    maneuver = NONE;
+    break;
+
   case TURN180:
-    // stop turn after 500 millis
-    if (millis() - lastMillis > 500) {
+    if (millis() - maneuver_millis > 1300) {
       maneuver = NONE;
     } 
     else {
@@ -94,10 +106,10 @@ void loop() {
 
   case OPENDOORS:
     // control number of millis per degree
-    if (millis() - lastMillis >= 10) {
+    if (millis() - maneuver_millis >= 10) {
       setDoors(doorAngle);
       doorAngle--;
-      lastMillis = millis();
+      maneuver_millis = millis();
       if (doorAngle < OPEN) {
         maneuver = NONE;
       }
@@ -105,10 +117,10 @@ void loop() {
     break;
 
   case CLOSEDOORS: 
-    if (millis() - lastMillis >= 10) {
+    if (millis() - maneuver_millis >= 10) {
       setDoors(doorAngle);
       doorAngle++;
-      lastMillis = millis();
+      maneuver_millis = millis();
       if (doorAngle > CLOSED) {
         maneuver = NONE;
       }
@@ -116,9 +128,9 @@ void loop() {
     break;
 
   default:
-    if (millis() - lastMillis > 300) {
+    if (millis() - last_request_millis > 300) {
       allWheels(2, 0);
-      lastMillis = millis();
+      last_request_millis = millis();
     }
     break;
   }
